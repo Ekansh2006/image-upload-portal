@@ -1,8 +1,8 @@
-# Image Upload with Firebase Storage - Technical Guide
+# Image Upload with Cloudinary - Technical Guide
 
 ## Overview
 
-This guide explains how to implement drag-and-drop and click-to-upload image functionality in a React Native app using Firebase Storage. The implementation supports both web and mobile platforms with proper error handling and user feedback.
+This guide explains how to implement drag-and-drop and click-to-upload image functionality in a React Native app using Cloudinary. The implementation supports both web and mobile platforms with proper error handling, image optimization, and user feedback.
 
 ## Architecture
 
@@ -15,60 +15,98 @@ app/
 │   ├── ImageUploader.tsx     # Reusable upload component
 │   └── ImageGrid.tsx         # Display uploaded images
 └── services/
-    └── firebase.ts           # Firebase configuration and storage functions
+    └── cloudinary.ts         # Cloudinary configuration and upload functions
 ```
 
 ## Technical Implementation
 
-### 1. Firebase Storage Setup
+### 1. Cloudinary Setup
 
-**File: `services/firebase.ts`**
+**File: `services/cloudinary.ts`**
 
-The Firebase service handles:
-- Storage initialization
-- Image upload with progress tracking
-- Error handling
+The Cloudinary service handles:
+- Image upload with automatic optimization
+- Progress tracking (where supported)
+- Error handling and retry logic
 - File validation
+- Image transformations and optimization
 
 ```typescript
-import { initializeApp } from 'firebase/app';
-import { getStorage, ref, uploadBytes, getDownloadURL, uploadBytesResumable } from 'firebase/storage';
+// Cloudinary configuration
+const CLOUDINARY_CLOUD_NAME = 'your-cloud-name';
+const CLOUDINARY_UPLOAD_PRESET = 'your-upload-preset';
+const CLOUDINARY_API_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
 
-const firebaseConfig = {
-  // Your Firebase config
-};
-
-const app = initializeApp(firebaseConfig);
-const storage = getStorage(app);
-
-export const uploadImage = async (
-  file: File | Blob,
+export const uploadImageToCloudinary = async (
+  imageUri: string,
   fileName: string,
   onProgress?: (progress: number) => void
-) => {
-  const storageRef = ref(storage, `images/${fileName}`);
-  
-  if (onProgress) {
-    const uploadTask = uploadBytesResumable(storageRef, file);
+): Promise<string> => {
+  try {
+    const formData = new FormData();
     
-    return new Promise((resolve, reject) => {
-      uploadTask.on(
-        'state_changed',
-        (snapshot) => {
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          onProgress(progress);
-        },
-        reject,
-        async () => {
-          const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-          resolve(downloadURL);
-        }
-      );
+    if (imageUri.startsWith('data:')) {
+      // Handle base64 data URLs (from web drag & drop)
+      const response = await fetch(imageUri);
+      const blob = await response.blob();
+      formData.append('file', blob, fileName);
+    } else {
+      // Handle file URIs (from mobile image picker)
+      const fileExtension = fileName.split('.').pop() || 'jpg';
+      const mimeType = `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`;
+      
+      formData.append('file', {
+        uri: imageUri,
+        type: mimeType,
+        name: fileName,
+      } as any);
+    }
+    
+    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+    formData.append('folder', 'uploads');
+    formData.append('public_id', `${Date.now()}_${fileName.split('.')[0]}`);
+    
+    const response = await fetch(CLOUDINARY_API_URL, {
+      method: 'POST',
+      body: formData,
+      headers: { 'Accept': 'application/json' },
     });
-  } else {
-    await uploadBytes(storageRef, file);
-    return getDownloadURL(storageRef);
+    
+    if (!response.ok) {
+      throw new Error(`Upload failed: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    return result.secure_url;
+  } catch (error) {
+    throw new Error(`Failed to upload image: ${error.message}`);
   }
+};
+
+// Generate optimized image URLs
+export const getOptimizedImageUrl = (
+  publicId: string,
+  options: {
+    width?: number;
+    height?: number;
+    quality?: 'auto' | number;
+    format?: 'auto' | 'webp' | 'jpg';
+  } = {}
+): string => {
+  const { width, height, quality = 'auto', format = 'auto' } = options;
+  let transformations = [];
+  
+  if (width || height) {
+    const dimensions = [];
+    if (width) dimensions.push(`w_${width}`);
+    if (height) dimensions.push(`h_${height}`);
+    transformations.push(dimensions.join(','));
+  }
+  
+  transformations.push(`q_${quality}`, `f_${format}`);
+  
+  const transformationString = transformations.join(',') + '/';
+  return `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/${transformationString}${publicId}`;
 };
 ```
 
@@ -82,7 +120,7 @@ Handles both web drag-and-drop and mobile image picker:
 import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, Platform, Alert } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { uploadImage } from '@/services/firebase';
+import { uploadImageToCloudinary } from '@/services/cloudinary';
 
 interface ImageUploaderProps {
   onUploadComplete: (url: string) => void;
@@ -118,10 +156,10 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({ onUploadComplete }
   const handleFileUpload = async (file: File) => {
     setUploading(true);
     try {
-      const url = await uploadImage(file, file.name, setProgress);
+      const url = await uploadImageToCloudinary(file.uri || URL.createObjectURL(file), file.name, setProgress);
       onUploadComplete(url);
     } catch (error) {
-      Alert.alert('Upload failed', error.message);
+      Alert.alert('Upload failed', error instanceof Error ? error.message : 'Unknown error');
     } finally {
       setUploading(false);
       setProgress(0);
@@ -267,20 +305,36 @@ const validateFile = (file: File) => {
 };
 ```
 
-### Firebase Security Rules
+### Cloudinary Upload Presets
+
+Cloudinary uses upload presets to define upload parameters and security settings:
+
 ```javascript
-// storage.rules
-rules_version = '2';
-service firebase.storage {
-  match /b/{bucket}/o {
-    match /images/{imageId} {
-      allow read, write: if request.auth != null
-        && resource.size < 5 * 1024 * 1024
-        && resource.contentType.matches('image/.*');
+// Cloudinary Upload Preset Configuration (via Dashboard)
+{
+  "name": "your-upload-preset",
+  "unsigned": true,
+  "folder": "uploads",
+  "allowed_formats": ["jpg", "jpeg", "png", "gif", "webp"],
+  "max_file_size": 5242880, // 5MB
+  "quality": "auto",
+  "format": "auto",
+  "transformation": [
+    {
+      "width": 2000,
+      "height": 2000,
+      "crop": "limit"
     }
-  }
+  ]
 }
 ```
+
+**Security Features:**
+- Unsigned uploads with preset restrictions
+- File size and format validation
+- Automatic image optimization
+- Folder organization
+- Rate limiting (configurable)
 
 ## Error Handling
 
@@ -288,20 +342,22 @@ service firebase.storage {
 1. **Network failures**: Retry mechanism with exponential backoff
 2. **File size limits**: Client-side validation before upload
 3. **Invalid file types**: MIME type checking
-4. **Storage quota**: Graceful degradation
-5. **Permission errors**: User-friendly error messages
+4. **Upload preset errors**: Configuration validation
+5. **Rate limiting**: Graceful handling of API limits
 
 ### Implementation
 ```typescript
 const handleUploadError = (error: any) => {
   let message = 'Upload failed. Please try again.';
   
-  if (error.code === 'storage/quota-exceeded') {
-    message = 'Storage quota exceeded. Please contact support.';
-  } else if (error.code === 'storage/unauthorized') {
-    message = 'You are not authorized to upload files.';
-  } else if (error.code === 'storage/canceled') {
-    message = 'Upload was canceled.';
+  if (error.message?.includes('File size too large')) {
+    message = 'File size exceeds the 5MB limit.';
+  } else if (error.message?.includes('Invalid file type')) {
+    message = 'Only JPEG, PNG, GIF, and WebP images are allowed.';
+  } else if (error.message?.includes('Upload preset')) {
+    message = 'Upload configuration error. Please contact support.';
+  } else if (error.message?.includes('Rate limit')) {
+    message = 'Too many uploads. Please wait a moment and try again.';
   }
   
   Alert.alert('Upload Error', message);
@@ -310,14 +366,39 @@ const handleUploadError = (error: any) => {
 
 ## Performance Optimization
 
-### Image Compression
+### Automatic Image Optimization
+Cloudinary automatically optimizes images:
+
+```typescript
+// Automatic optimization is built into Cloudinary
+// No manual compression needed - handled server-side
+
+// For display, use optimized URLs:
+const optimizedUrl = getOptimizedImageUrl(publicId, {
+  width: 400,
+  height: 300,
+  quality: 'auto',
+  format: 'auto' // Automatically serves WebP to supported browsers
+});
+
+// For thumbnails:
+const thumbnailUrl = getOptimizedImageUrl(publicId, {
+  width: 150,
+  height: 150,
+  quality: 80,
+  format: 'webp'
+});
+```
+
+### Client-side Optimization (Optional)
 ```typescript
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 
-const compressImage = async (uri: string) => {
+// Only compress if needed for very large images
+const compressIfNeeded = async (uri: string, maxSize: number = 2048) => {
   const result = await manipulateAsync(
     uri,
-    [{ resize: { width: 1024 } }], // Resize to max width of 1024px
+    [{ resize: { width: maxSize } }],
     { compress: 0.8, format: SaveFormat.JPEG }
   );
   return result.uri;
@@ -369,12 +450,12 @@ const ImageGrid = () => {
 
 ## Deployment Considerations
 
-### Firebase Configuration
-1. Set up Firebase project
-2. Enable Storage service
-3. Configure security rules
-4. Set up authentication (if required)
-5. Configure CORS for web access
+### Cloudinary Setup
+1. Create Cloudinary account
+2. Get your Cloud Name from the dashboard
+3. Create an unsigned upload preset
+4. Configure upload restrictions and transformations
+5. Set up folder structure (optional)
 
 ### Environment Variables
 ```typescript
@@ -382,13 +463,23 @@ const ImageGrid = () => {
 export default {
   expo: {
     extra: {
-      firebaseApiKey: process.env.FIREBASE_API_KEY,
-      firebaseAuthDomain: process.env.FIREBASE_AUTH_DOMAIN,
-      firebaseStorageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+      cloudinaryCloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      cloudinaryUploadPreset: process.env.CLOUDINARY_UPLOAD_PRESET,
     }
   }
 };
+
+// In your service file:
+const CLOUDINARY_CLOUD_NAME = process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME || 'your-cloud-name';
+const CLOUDINARY_UPLOAD_PRESET = process.env.EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET || 'your-upload-preset';
 ```
+
+### Cloudinary Dashboard Configuration
+1. **Upload Presets**: Create unsigned presets for client uploads
+2. **Transformations**: Set up automatic image optimization
+3. **Folders**: Organize uploads by date, user, or category
+4. **Webhooks**: Set up notifications for upload events (optional)
+5. **Analytics**: Monitor usage and performance
 
 ## Monitoring & Analytics
 
@@ -406,4 +497,25 @@ const trackUpload = (success: boolean, duration: number, fileSize: number) => {
 };
 ```
 
-This implementation provides a robust, cross-platform image upload solution with proper error handling, performance optimization, and security considerations.
+This implementation provides a robust, cross-platform image upload solution with Cloudinary's powerful features including automatic optimization, transformations, and CDN delivery, along with proper error handling and security considerations.
+
+## Cloudinary Advantages
+
+### Built-in Features
+- **Automatic Optimization**: Smart compression and format selection
+- **CDN Delivery**: Global content delivery network
+- **Image Transformations**: Resize, crop, and enhance on-the-fly
+- **Format Conversion**: Automatic WebP/AVIF serving to supported browsers
+- **Analytics**: Detailed usage and performance metrics
+
+### Advanced Features
+- **AI-powered cropping**: Automatic subject detection
+- **Background removal**: AI-powered background removal
+- **Face detection**: Automatic face-aware cropping
+- **Video support**: Upload and transform videos
+- **Backup and versioning**: Automatic backup of all assets
+
+### Cost Efficiency
+- **Free tier**: 25GB storage and 25GB bandwidth
+- **Pay-as-you-scale**: Only pay for what you use
+- **Bandwidth optimization**: Reduced costs through automatic optimization
